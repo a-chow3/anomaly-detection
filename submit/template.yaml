@@ -1,0 +1,246 @@
+# cloudformation solution goes here
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DS5220 Data Project 1 — Full anomaly detection stack:
+  EC2 (Ubuntu 24.04), S3 bucket, IAM role, SNS topic + HTTP subscription,
+  S3 event notification, Elastic IP, Security Group.
+
+# ─────────────────────────────────────────────
+# PARAMETERS
+# ─────────────────────────────────────────────
+Parameters:
+
+  YourIP:
+    Type: String
+    # TODO: Replace the default with your actual public IP in x.x.x.x/32 format.
+    # Find it by running: curl ifconfig.me
+    Default: "YOUR.IP.ADDRESS.HERE/32"
+    Description: Your local IP for SSH access (port 22)
+
+  GitHubRepo:
+    Type: String
+    # TODO: Replace with your actual forked repo URL
+    Default: "https://github.com/YOUR-USERNAME/anomaly-detection.git"
+    Description: Your forked anomaly-detection repo
+
+# ─────────────────────────────────────────────
+# RESOURCES
+# ─────────────────────────────────────────────
+Resources:
+
+  # ── 1. S3 BUCKET ──────────────────────────────────────────────────────────
+  AnomalyBucket:
+    Type: AWS::S3::Bucket
+    # DeletionPolicy retain keeps the bucket alive after stack delete
+    # (required since it will contain objects)
+    DeletionPolicy: Retain
+    Properties:
+      # CloudFormation auto-generates a unique name from stack name + random suffix
+      # You can also hardcode a name here if you prefer, e.g. "ds5220-dp1-yourname"
+      BucketName: !Sub "ds5220-dp1-${AWS::AccountId}-${AWS::Region}"
+
+  # ── 2. SNS TOPIC ──────────────────────────────────────────────────────────
+  AnomalySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ds5220-dp1
+
+  # ── 3. SNS TOPIC POLICY ───────────────────────────────────────────────────
+  # This is CRITICAL. Without it, S3 cannot publish events to SNS.
+  # This is the answer to graduate question #2 (what grants SNS permission).
+  AnomalySNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AnomalySNSTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3ToPublish
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AnomalySNSTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::ds5220-dp1-${AWS::AccountId}-${AWS::Region}"
+
+  # ── 4. IAM ROLE ───────────────────────────────────────────────────────────
+  AnomalyInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ds5220-dp1-ec2-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AnomalyS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: FullAccessToAnomalyBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  # Grants actions on the bucket itself (for ListBucket)
+                  - !GetAtt AnomalyBucket.Arn
+                  # Grants actions on all objects inside the bucket
+                  - !Sub "${AnomalyBucket.Arn}/*"
+
+  # ── 5. IAM INSTANCE PROFILE ───────────────────────────────────────────────
+  # EC2 instances don't attach roles directly — they attach instance profiles.
+  AnomalyInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref AnomalyInstanceRole
+
+  # ── 6. SECURITY GROUP ─────────────────────────────────────────────────────
+  AnomalySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH from my IP and API from anywhere
+      SecurityGroupIngress:
+        # SSH — your IP only
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref YourIP
+        # FastAPI — open to the world so SNS can reach /notify
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: "0.0.0.0/0"
+
+  # ── 7. EC2 INSTANCE ───────────────────────────────────────────────────────
+  AnomalyInstance:
+    Type: AWS::EC2::Instance
+    # Tell CloudFormation to wait for S3 bucket and SNS topic before launching
+    DependsOn:
+      - AnomalyBucket
+      - AnomalySNSTopic
+    Properties:
+      # Ubuntu 24.04 LTS (us-east-1) — verify this AMI ID is current in your region
+      # Check current AMI: aws ec2 describe-images --owners 099720109477 \
+      #   --filters "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*" \
+      #   --query "sort_by(Images,&CreationDate)[-1].ImageId"
+      ImageId: ami-0e1bed4f06a3b163d
+      InstanceType: t3.micro
+      IamInstanceProfile: !Ref AnomalyInstanceProfile
+      SecurityGroups:
+        - !Ref AnomalySecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+      # !Sub allows us to inject CloudFormation values into the bash script
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            set -e
+
+            # ── System packages ──────────────────────────────────────────
+            apt-get update -y
+            apt-get install -y git python3 python3-pip python3-venv
+
+            # ── Clone your fork ──────────────────────────────────────────
+            git clone ${GitHubRepo} /opt/anomaly-detection
+
+            # ── Set BUCKET_NAME globally for all future logins/reboots ───
+            # !Sub replaces ${AnomalyBucket} with the actual bucket name at deploy time
+            echo "BUCKET_NAME=${AnomalyBucket}" >> /etc/environment
+
+            # ── Export for this bootstrap session ────────────────────────
+            export BUCKET_NAME=${AnomalyBucket}
+
+            # ── Python virtual environment ───────────────────────────────
+            python3 -m venv /opt/anomaly-detection/venv
+            /opt/anomaly-detection/venv/bin/pip install --upgrade pip
+            /opt/anomaly-detection/venv/bin/pip install -r /opt/anomaly-detection/requirements.txt
+
+            # ── Start FastAPI on boot ────────────────────────────────────
+            # Runs in background; nohup keeps it alive after bootstrap exits
+            nohup /opt/anomaly-detection/venv/bin/fastapi run \
+              /opt/anomaly-detection/app.py \
+              --host 0.0.0.0 \
+              --port 8000 \
+              > /opt/anomaly-detection/startup.log 2>&1 &
+
+  # ── 8. ELASTIC IP ─────────────────────────────────────────────────────────
+  AnomalyEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref AnomalyInstance
+
+  # ── 9. SNS HTTP SUBSCRIPTION ──────────────────────────────────────────────
+  # This subscribes the EC2's /notify endpoint to the SNS topic.
+  # SNS will POST to this URL whenever S3 drops a new file.
+  AnomalySNSSubscription:
+    Type: AWS::SNS::Subscription
+    # Must wait for EIP to exist so we have a real IP to reference
+    DependsOn: AnomalyEIP
+    Properties:
+      TopicArn: !Ref AnomalySNSTopic
+      Protocol: http
+      # !Sub builds the full URL using the EIP's public IP attribute
+      Endpoint: !Sub "http://${AnomalyEIP}:8000/notify"
+
+  # ── 10. S3 EVENT NOTIFICATION ─────────────────────────────────────────────
+  # Tells S3 to publish to SNS whenever a .csv lands under raw/
+  # IMPORTANT: prefix raw/ and suffix .csv prevent the recursion trap
+  # (scored output goes to processed/, not raw/, so no infinite loop)
+  AnomalyBucketNotification:
+    Type: AWS::S3::BucketNotification
+    # SNS topic policy must exist before S3 can be configured to publish to it
+    DependsOn: AnomalySNSTopicPolicy
+    Properties:
+      Bucket: !Ref AnomalyBucket
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "raw/"
+                  - Name: suffix
+                    Value: ".csv"
+            Topic: !Ref AnomalySNSTopic
+
+# OUTPUTS ─────────────────────────────────────────────
+# These print to the CloudFormation console after stack creation —
+# useful for grabbing your IP, bucket name, and topic ARN quickly.
+Outputs:
+
+  InstancePublicIP:
+    Description: Elastic IP of the EC2 instance
+    Value: !Ref AnomalyEIP
+
+  BucketName:
+    Description: S3 bucket used by the application
+    Value: !Ref AnomalyBucket
+
+  SNSTopicArn:
+    Description: ARN of the ds5220-dp1 SNS topic
+    Value: !Ref AnomalySNSTopic
+
+  APIEndpoint:
+    Description: FastAPI base URL
+    Value: !Sub "http://${AnomalyEIP}:8000"
+
+  NotifyEndpoint:
+    Description: SNS subscription endpoint
+    Value: !Sub "http://${AnomalyEIP}:8000/notify"
