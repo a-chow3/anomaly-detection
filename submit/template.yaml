@@ -1,5 +1,4 @@
-# cloudformation solution goes here
-cat > submit/template.yaml << 'EOF'
+cat > submit/template.yaml << 'ENDOFFILE'
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   DS5220 Data Project 1 — Full anomaly detection stack:
@@ -198,4 +197,4 @@ Outputs:
   NotifyEndpoint:
     Description: SNS subscription endpoint
     Value: !Sub "http://${AnomalyEIP}:8000/notify"
-EOF
+ENDOFFILE
