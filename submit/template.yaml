@@ -126,7 +126,7 @@ Resources:
       - AnomalyBucket
       - AnomalySNSTopic
     Properties:
-      ImageId: ami-0e1bed4f06a3b163d
+      ImageId: ami-0071174ad8cbb9e17
       InstanceType: t3.micro
       IamInstanceProfile: !Ref AnomalyInstanceProfile
       SecurityGroups:
