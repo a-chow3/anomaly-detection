@@ -31,13 +31,21 @@ Resources:
   # ── 1. S3 BUCKET ──────────────────────────────────────────────────────────
   AnomalyBucket:
     Type: AWS::S3::Bucket
-    # DeletionPolicy retain keeps the bucket alive after stack delete
-    # (required since it will contain objects)
+    DependsOn: AnomalySNSTopicPolicy
     DeletionPolicy: Retain
     Properties:
-      # CloudFormation auto-generates a unique name from stack name + random suffix
-      # You can also hardcode a name here if you prefer, e.g. "ds5220-dp1-yourname"
       BucketName: !Sub "ds5220-dp1-${AWS::AccountId}-${AWS::Region}"
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "raw/"
+                  - Name: suffix
+                    Value: ".csv"
+            Topic: !Ref AnomalySNSTopic
 
   # ── 2. SNS TOPIC ──────────────────────────────────────────────────────────
   AnomalySNSTopic:
@@ -64,7 +72,7 @@ Resources:
             Resource: !Ref AnomalySNSTopic
             Condition:
               ArnLike:
-                aws:SourceArn: !Sub "arn:aws:s3:::ds5220-dp1-${AWS::AccountId}-${AWS::Region}"
+                aws:SourceAccount: !Ref AWS::AccountId
 
   # ── 4. IAM ROLE ───────────────────────────────────────────────────────────
   AnomalyInstanceRole:
@@ -204,21 +212,6 @@ Resources:
   # (scored output goes to processed/, not raw/, so no infinite loop)
   AnomalyBucketNotification:
     Type: AWS::S3::BucketNotification
-    # SNS topic policy must exist before S3 can be configured to publish to it
-    DependsOn: AnomalySNSTopicPolicy
-    Properties:
-      Bucket: !Ref AnomalyBucket
-      NotificationConfiguration:
-        TopicConfigurations:
-          - Event: "s3:ObjectCreated:*"
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: "raw/"
-                  - Name: suffix
-                    Value: ".csv"
-            Topic: !Ref AnomalySNSTopic
 
 # OUTPUTS ─────────────────────────────────────────────
 # These print to the CloudFormation console after stack creation —
